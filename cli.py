@@ -67,6 +67,51 @@ from hermes_cli.banner import _format_context_length
 
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
+_SHIFT_ENTER_SEQUENCES = (
+    '\x1b[27;2;13~',  # xterm modifyOtherKeys (Ghostty default)
+    '\x1b[13;2u',  # CSI u (kitty keyboard protocol)
+)
+
+
+@contextmanager
+def _temporary_vt100_sequence_mappings(mappings: dict[str, object]):
+    """Temporarily override prompt_toolkit VT100 key sequence mappings."""
+    from prompt_toolkit.input.vt100_parser import (
+        ANSI_SEQUENCES,
+        _IS_PREFIX_OF_LONGER_MATCH_CACHE,
+    )
+
+    missing = object()
+    previous_values = {
+        sequence: ANSI_SEQUENCES.get(sequence, missing)
+        for sequence in mappings
+    }
+    prefix_keys = {
+        sequence[:index]
+        for sequence in mappings
+        for index in range(1, len(sequence))
+    }
+    previous_prefix_cache = {
+        prefix: _IS_PREFIX_OF_LONGER_MATCH_CACHE.get(prefix, missing)
+        for prefix in prefix_keys
+    }
+    for prefix in prefix_keys:
+        _IS_PREFIX_OF_LONGER_MATCH_CACHE.pop(prefix, None)
+    ANSI_SEQUENCES.update(mappings)
+    try:
+        yield
+    finally:
+        for sequence, previous in previous_values.items():
+            if previous is missing:
+                ANSI_SEQUENCES.pop(sequence, None)
+            else:
+                ANSI_SEQUENCES[sequence] = previous
+        for prefix, previous in previous_prefix_cache.items():
+            if previous is missing:
+                _IS_PREFIX_OF_LONGER_MATCH_CACHE.pop(prefix, None)
+            else:
+                _IS_PREFIX_OF_LONGER_MATCH_CACHE[prefix] = previous
+
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -2652,7 +2697,9 @@ class HermesCLI:
                 )
 
         _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
-        _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}")
+        _cprint(
+            f"  {_DIM}Multi-line: Alt+Enter, or Shift+Enter in compatible terminals{_RST}"
+        )
         _cprint(f"  {_DIM}Paste image: Alt+V (or /paste){_RST}\n")
     
     def show_tools(self):
@@ -6319,14 +6366,14 @@ class HermesCLI:
             """Alt+Enter inserts a newline for multi-line input."""
             event.current_buffer.insert_text('\n')
 
-        @kb.add('s-enter')
-        def handle_shift_enter(event):
-            """Shift+Enter inserts a newline for multi-line input."""
-            event.current_buffer.insert_text('\n')
-
-        @kb.add('c-j')
+        @kb.add('c-j', eager=True)
         def handle_ctrl_enter(event):
-            """Ctrl+Enter (c-j) inserts a newline. Most terminals send c-j for Ctrl+Enter."""
+            """Ctrl+Enter / Shift+Enter (c-j) inserts a newline.
+
+            eager=True ensures this fires before prompt_toolkit's default
+            _newline2 handler which would convert c-j -> c-m (Enter/submit).
+            Shift+Enter reaches here via the temporary ANSI remapping below.
+            """
             event.current_buffer.insert_text('\n')
 
         @kb.add('tab', eager=True)
@@ -7190,221 +7237,241 @@ class HermesCLI:
             'voice-status-recording': 'bg:#1a1a2e #FF4444 bold',
         }
         style = PTStyle.from_dict(self._build_tui_style_dict())
-        
-        # Create the application
-        app = Application(
-            layout=layout,
-            key_bindings=kb,
-            style=style,
-            full_screen=False,
-            mouse_support=False,
-            **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
-        )
-        self._app = app  # Store reference for clarify_callback
 
-        def spinner_loop():
-            import time as _time
+        # Shift+Enter inserts a newline instead of submitting.
+        # Terminals send shift+enter as either:
+        #   - xterm modifyOtherKeys: \x1b[27;2;13~ (Ghostty, most terminals)
+        #   - CSI u:                 \x1b[13;2u    (kitty protocol)
+        # prompt_toolkit maps the xterm sequence to ControlM (submit) and
+        # leaves the CSI u sequence unmapped. Remap both to ControlJ for the
+        # lifetime of this TUI so the eager c-j handler above inserts '\n'.
+        shift_enter_mappings = {
+            sequence: Keys.ControlJ for sequence in _SHIFT_ENTER_SEQUENCES
+        }
+        with _temporary_vt100_sequence_mappings(shift_enter_mappings):
+            # Create the application
+            app = Application(
+                layout=layout,
+                key_bindings=kb,
+                style=style,
+                full_screen=False,
+                mouse_support=False,
+                **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
+            )
+            self._app = app  # Store reference for clarify_callback
 
-            last_idle_refresh = 0.0
-            while not self._should_exit:
-                if not self._app:
-                    _time.sleep(0.1)
-                    continue
-                if self._command_running:
-                    self._invalidate(min_interval=0.1)
-                    _time.sleep(0.1)
-                else:
-                    now = _time.monotonic()
-                    if now - last_idle_refresh >= 1.0:
-                        last_idle_refresh = now
-                        self._invalidate(min_interval=1.0)
-                    _time.sleep(0.2)
+            def spinner_loop():
+                import time as _time
 
-        spinner_thread = threading.Thread(target=spinner_loop, daemon=True)
-        spinner_thread.start()
-        
-        # Background thread to process inputs and run agent
-        def process_loop():
-            while not self._should_exit:
-                try:
-                    # Check for pending input with timeout
-                    try:
-                        user_input = self._pending_input.get(timeout=0.1)
-                    except queue.Empty:
-                        # Periodic config watcher — auto-reload MCP on mcp_servers change
-                        if not self._agent_running:
-                            self._check_config_mcp_changes()
+                last_idle_refresh = 0.0
+                while not self._should_exit:
+                    if not self._app:
+                        _time.sleep(0.1)
                         continue
-                    
-                    if not user_input:
-                        continue
-
-                    # Unpack image payload: (text, [Path, ...]) or plain str
-                    submit_images = []
-                    if isinstance(user_input, tuple):
-                        user_input, submit_images = user_input
-                    
-                    # Check for commands
-                    if isinstance(user_input, str) and user_input.startswith("/"):
-                        _cprint(f"\n⚙️  {user_input}")
-                        if not self.process_command(user_input):
-                            self._should_exit = True
-                            # Schedule app exit
-                            if app.is_running:
-                                app.exit()
-                        continue
-                    
-                    # Expand paste references back to full content
-                    import re as _re
-                    _paste_ref_re = _re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
-                    paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
-                    if paste_refs:
-                        def _expand_ref(m):
-                            p = Path(m.group(1))
-                            return p.read_text(encoding="utf-8") if p.exists() else m.group(0)
-                        expanded = _paste_ref_re.sub(_expand_ref, user_input)
-                        total_lines = expanded.count('\n') + 1
-                        n_pastes = len(paste_refs)
-                        _user_bar = f"[{_accent_hex()}]{'─' * 40}[/]"
-                        print()
-                        ChatConsole().print(_user_bar)
-                        # Show any surrounding user text alongside the paste summary
-                        split_parts = _paste_ref_re.split(user_input)
-                        visible_user_text = " ".join(
-                            split_parts[i].strip() for i in range(0, len(split_parts), 2) if split_parts[i].strip()
-                        )
-                        if visible_user_text:
-                            ChatConsole().print(
-                                f"[bold {_accent_hex()}]\u25cf[/] [bold]{_escape(visible_user_text)}[/] "
-                                f"[dim]({n_pastes} pasted block{'s' if n_pastes > 1 else ''}, {total_lines} lines total)[/]"
-                            )
-                        else:
-                            ChatConsole().print(
-                                f"[bold {_accent_hex()}]\u25cf[/] [bold]{_escape(f'[Pasted text: {total_lines} lines]')}[/]"
-                            )
-                        user_input = expanded
+                    if self._command_running:
+                        self._invalidate(min_interval=0.1)
+                        _time.sleep(0.1)
                     else:
-                        _user_bar = f"[{_accent_hex()}]{'─' * 40}[/]"
-                        if '\n' in user_input:
-                            first_line = user_input.split('\n')[0]
-                            line_count = user_input.count('\n') + 1
-                            print()
-                            ChatConsole().print(_user_bar)
-                            ChatConsole().print(
-                                f"[bold {_accent_hex()}]●[/] [bold]{_escape(first_line)}[/] "
-                                f"[dim](+{line_count - 1} lines)[/]"
-                            )
-                        else:
-                            print()
-                            ChatConsole().print(_user_bar)
-                            ChatConsole().print(f"[bold {_accent_hex()}]●[/] [bold]{_escape(user_input)}[/]")
-                    
-                    # Show image attachment count
-                    if submit_images:
-                        n = len(submit_images)
-                        _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
+                        now = _time.monotonic()
+                        if now - last_idle_refresh >= 1.0:
+                            last_idle_refresh = now
+                            self._invalidate(min_interval=1.0)
+                        _time.sleep(0.2)
 
-                    # Regular chat - run agent
-                    self._agent_running = True
-                    app.invalidate()  # Refresh status line
+            spinner_thread = threading.Thread(target=spinner_loop, daemon=True)
+            spinner_thread.start()
 
+            # Background thread to process inputs and run agent
+            def process_loop():
+                while not self._should_exit:
                     try:
-                        self.chat(user_input, images=submit_images or None)
-                    finally:
-                        self._agent_running = False
-                        self._spinner_text = ""
+                        # Check for pending input with timeout
+                        try:
+                            user_input = self._pending_input.get(timeout=0.1)
+                        except queue.Empty:
+                            # Periodic config watcher — auto-reload MCP on mcp_servers change
+                            if not self._agent_running:
+                                self._check_config_mcp_changes()
+                            continue
+
+                        if not user_input:
+                            continue
+
+                        # Unpack image payload: (text, [Path, ...]) or plain str
+                        submit_images = []
+                        if isinstance(user_input, tuple):
+                            user_input, submit_images = user_input
+
+                        # Check for commands
+                        if isinstance(user_input, str) and user_input.startswith("/"):
+                            _cprint(f"\n⚙️  {user_input}")
+                            if not self.process_command(user_input):
+                                self._should_exit = True
+                                # Schedule app exit
+                                if app.is_running:
+                                    app.exit()
+                            continue
+
+                        # Expand paste references back to full content
+                        import re as _re
+
+                        _paste_ref_re = _re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
+                        paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
+                        if paste_refs:
+                            def _expand_ref(m):
+                                p = Path(m.group(1))
+                                return p.read_text(encoding="utf-8") if p.exists() else m.group(0)
+
+                            expanded = _paste_ref_re.sub(_expand_ref, user_input)
+                            total_lines = expanded.count('\n') + 1
+                            n_pastes = len(paste_refs)
+                            _user_bar = f"[{_accent_hex()}]{'─' * 40}[/]"
+                            print()
+                            ChatConsole().print(_user_bar)
+                            # Show any surrounding user text alongside the paste summary
+                            split_parts = _paste_ref_re.split(user_input)
+                            visible_user_text = " ".join(
+                                split_parts[i].strip()
+                                for i in range(0, len(split_parts), 2)
+                                if split_parts[i].strip()
+                            )
+                            if visible_user_text:
+                                ChatConsole().print(
+                                    f"[bold {_accent_hex()}]\u25cf[/] [bold]{_escape(visible_user_text)}[/] "
+                                    f"[dim]({n_pastes} pasted block{'s' if n_pastes > 1 else ''}, {total_lines} lines total)[/]"
+                                )
+                            else:
+                                ChatConsole().print(
+                                    f"[bold {_accent_hex()}]\u25cf[/] [bold]{_escape(f'[Pasted text: {total_lines} lines]')}[/]"
+                                )
+                            user_input = expanded
+                        else:
+                            _user_bar = f"[{_accent_hex()}]{'─' * 40}[/]"
+                            if '\n' in user_input:
+                                first_line = user_input.split('\n')[0]
+                                line_count = user_input.count('\n') + 1
+                                print()
+                                ChatConsole().print(_user_bar)
+                                ChatConsole().print(
+                                    f"[bold {_accent_hex()}]●[/] [bold]{_escape(first_line)}[/] "
+                                    f"[dim](+{line_count - 1} lines)[/]"
+                                )
+                            else:
+                                print()
+                                ChatConsole().print(_user_bar)
+                                ChatConsole().print(
+                                    f"[bold {_accent_hex()}]●[/] [bold]{_escape(user_input)}[/]"
+                                )
+
+                        # Show image attachment count
+                        if submit_images:
+                            n = len(submit_images)
+                            _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
+
+                        # Regular chat - run agent
+                        self._agent_running = True
                         app.invalidate()  # Refresh status line
 
-                        # Continuous voice: auto-restart recording after agent responds.
-                        # Dispatch to a daemon thread so play_beep (sd.wait) and
-                        # AudioRecorder.start (lock acquire) never block process_loop —
-                        # otherwise queued user input would stall silently.
-                        if self._voice_mode and self._voice_continuous and not self._voice_recording:
-                            def _restart_recording():
-                                try:
-                                    if self._voice_tts:
-                                        self._voice_tts_done.wait(timeout=60)
-                                        time.sleep(0.3)
-                                    self._voice_start_recording()
-                                    app.invalidate()
-                                except Exception as e:
-                                    _cprint(f"{_DIM}Voice auto-restart failed: {e}{_RST}")
-                            threading.Thread(target=_restart_recording, daemon=True).start()
-                    
-                except Exception as e:
-                    print(f"Error: {e}")
-        
-        # Start processing thread
-        process_thread = threading.Thread(target=process_loop, daemon=True)
-        process_thread.start()
-        
-        # Register atexit cleanup so resources are freed even on unexpected exit
-        atexit.register(_run_cleanup)
-        
-        # Install a custom asyncio exception handler that suppresses the
-        # "Event loop is closed" RuntimeError from httpx transport cleanup.
-        # This is defense-in-depth — the primary fix is neuter_async_httpx_del
-        # which disables __del__ entirely, but older clients or SDK upgrades
-        # could bypass it.
-        def _suppress_closed_loop_errors(loop, context):
-            exc = context.get("exception")
-            if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
-                return  # silently suppress
-            # Fall back to default handler for everything else
-            loop.default_exception_handler(context)
+                        try:
+                            self.chat(user_input, images=submit_images or None)
+                        finally:
+                            self._agent_running = False
+                            self._spinner_text = ""
+                            app.invalidate()  # Refresh status line
 
-        # Run the application with patch_stdout for proper output handling
-        try:
-            with patch_stdout():
-                # Set the custom handler on prompt_toolkit's event loop
-                try:
-                    import asyncio as _aio
-                    _loop = _aio.get_event_loop()
-                    _loop.set_exception_handler(_suppress_closed_loop_errors)
-                except Exception:
-                    pass
-                app.run()
-        except (EOFError, KeyboardInterrupt):
-            pass
-        finally:
-            self._should_exit = True
-            # Flush memories before exit (only for substantial conversations)
-            if self.agent and self.conversation_history:
-                try:
-                    self.agent.flush_memories(self.conversation_history)
-                except (Exception, KeyboardInterrupt):
-                    pass
-            # Shut down voice recorder (release persistent audio stream)
-            if hasattr(self, '_voice_recorder') and self._voice_recorder:
-                try:
-                    self._voice_recorder.shutdown()
-                except Exception:
-                    pass
-                self._voice_recorder = None
-            # Clean up old temp voice recordings
+                            # Continuous voice: auto-restart recording after agent responds.
+                            # Dispatch to a daemon thread so play_beep (sd.wait) and
+                            # AudioRecorder.start (lock acquire) never block process_loop —
+                            # otherwise queued user input would stall silently.
+                            if self._voice_mode and self._voice_continuous and not self._voice_recording:
+                                def _restart_recording():
+                                    try:
+                                        if self._voice_tts:
+                                            self._voice_tts_done.wait(timeout=60)
+                                            time.sleep(0.3)
+                                        self._voice_start_recording()
+                                        app.invalidate()
+                                    except Exception as e:
+                                        _cprint(f"{_DIM}Voice auto-restart failed: {e}{_RST}")
+
+                                threading.Thread(target=_restart_recording, daemon=True).start()
+
+                    except Exception as e:
+                        print(f"Error: {e}")
+
+            # Start processing thread
+            process_thread = threading.Thread(target=process_loop, daemon=True)
+            process_thread.start()
+
+            # Register atexit cleanup so resources are freed even on unexpected exit
+            atexit.register(_run_cleanup)
+
+            # Install a custom asyncio exception handler that suppresses the
+            # "Event loop is closed" RuntimeError from httpx transport cleanup.
+            # This is defense-in-depth — the primary fix is neuter_async_httpx_del
+            # which disables __del__ entirely, but older clients or SDK upgrades
+            # could bypass it.
+            def _suppress_closed_loop_errors(loop, context):
+                exc = context.get("exception")
+                if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
+                    return  # silently suppress
+                # Fall back to default handler for everything else
+                loop.default_exception_handler(context)
+
+            # Run the application with patch_stdout for proper output handling
             try:
-                from tools.voice_mode import cleanup_temp_recordings
-                cleanup_temp_recordings()
-            except Exception:
+                with patch_stdout():
+                    # Set the custom handler on prompt_toolkit's event loop
+                    try:
+                        import asyncio as _aio
+
+                        _loop = _aio.get_event_loop()
+                        _loop.set_exception_handler(_suppress_closed_loop_errors)
+                    except Exception:
+                        pass
+                    app.run()
+            except (EOFError, KeyboardInterrupt):
                 pass
-            # Unregister callbacks to avoid dangling references
-            set_sudo_password_callback(None)
-            set_approval_callback(None)
-            set_secret_capture_callback(None)
-            # Flush + shut down Honcho async writer (drains queue before exit)
-            if self.agent and getattr(self.agent, '_honcho', None):
+            finally:
+                self._should_exit = True
+                # Flush memories before exit (only for substantial conversations)
+                if self.agent and self.conversation_history:
+                    try:
+                        self.agent.flush_memories(self.conversation_history)
+                    except (Exception, KeyboardInterrupt):
+                        pass
+                # Shut down voice recorder (release persistent audio stream)
+                if hasattr(self, '_voice_recorder') and self._voice_recorder:
+                    try:
+                        self._voice_recorder.shutdown()
+                    except Exception:
+                        pass
+                    self._voice_recorder = None
+                # Clean up old temp voice recordings
                 try:
-                    self.agent._honcho.shutdown()
-                except (Exception, KeyboardInterrupt):
+                    from tools.voice_mode import cleanup_temp_recordings
+
+                    cleanup_temp_recordings()
+                except Exception:
                     pass
-            # Close session in SQLite
-            if hasattr(self, '_session_db') and self._session_db and self.agent:
-                try:
-                    self._session_db.end_session(self.agent.session_id, "cli_close")
-                except (Exception, KeyboardInterrupt) as e:
-                    logger.debug("Could not close session in DB: %s", e)
-            _run_cleanup()
-            self._print_exit_summary()
+                # Unregister callbacks to avoid dangling references
+                set_sudo_password_callback(None)
+                set_approval_callback(None)
+                set_secret_capture_callback(None)
+                # Flush + shut down Honcho async writer (drains queue before exit)
+                if self.agent and getattr(self.agent, '_honcho', None):
+                    try:
+                        self.agent._honcho.shutdown()
+                    except (Exception, KeyboardInterrupt):
+                        pass
+                # Close session in SQLite
+                if hasattr(self, '_session_db') and self._session_db and self.agent:
+                    try:
+                        self._session_db.end_session(self.agent.session_id, "cli_close")
+                    except (Exception, KeyboardInterrupt) as e:
+                        logger.debug("Could not close session in DB: %s", e)
+                _run_cleanup()
+                self._print_exit_summary()
 
 
 # ============================================================================
