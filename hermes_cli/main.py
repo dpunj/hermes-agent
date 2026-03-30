@@ -2461,6 +2461,34 @@ def cmd_uninstall(args):
     run_uninstall(args)
 
 
+def _clear_bytecode_cache(root: Path) -> int:
+    """Remove all __pycache__ directories under *root*.
+
+    Stale .pyc files can cause ImportError after code updates when Python
+    loads a cached bytecode file that references names that no longer exist
+    (or don't yet exist) in the updated source.  Clearing them forces Python
+    to recompile from the .py source on next import.
+
+    Returns the number of directories removed.
+    """
+    removed = 0
+    for dirpath, dirnames, _ in os.walk(root):
+        # Skip venv / node_modules / .git entirely
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in ("venv", ".venv", "node_modules", ".git", ".worktrees")
+        ]
+        if os.path.basename(dirpath) == "__pycache__":
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(dirpath)
+                removed += 1
+            except OSError:
+                pass
+            dirnames.clear()  # nothing left to recurse into
+    return removed
+
+
 def _update_via_zip(args):
     """Update Hermes Agent by downloading a ZIP archive.
     
@@ -2502,7 +2530,7 @@ def _update_via_zip(args):
                     break
         
         # Copy updated files over existing installation, preserving venv/node_modules/.git
-        preserve = {'venv', 'node_modules', '.git', '__pycache__', '.env'}
+        preserve = {'venv', 'node_modules', '.git', '.env'}
         update_count = 0
         for item in os.listdir(extracted):
             if item in preserve:
@@ -2525,6 +2553,11 @@ def _update_via_zip(args):
     except Exception as e:
         print(f"✗ ZIP update failed: {e}")
         sys.exit(1)
+
+    # Clear stale bytecode after ZIP extraction
+    removed = _clear_bytecode_cache(PROJECT_ROOT)
+    if removed:
+        print(f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}")
     
     # Reinstall Python dependencies (try .[all] first for optional extras,
     # fall back to . if extras fail — mirrors the install script behavior)
@@ -2923,6 +2956,13 @@ def cmd_update(args):
                     )
         
         _invalidate_update_cache()
+
+        # Clear stale .pyc bytecode cache — prevents ImportError on gateway
+        # restart when updated source references names that didn't exist in
+        # the old bytecode (e.g. get_hermes_home added to hermes_constants).
+        removed = _clear_bytecode_cache(PROJECT_ROOT)
+        if removed:
+            print(f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}")
         
         # Reinstall Python dependencies (try .[all] first for optional extras,
         # fall back to . if extras fail — mirrors the install script behavior)
@@ -2970,6 +3010,17 @@ def cmd_update(args):
         
         print()
         print("✓ Code updated!")
+        
+        # After git pull, source files on disk are newer than cached Python
+        # modules in this process.  Reload hermes_constants so that any lazy
+        # import executed below (skills sync, gateway restart) sees new
+        # attributes like display_hermes_home() added since the last release.
+        try:
+            import importlib
+            import hermes_constants as _hc
+            importlib.reload(_hc)
+        except Exception:
+            pass  # non-fatal — worst case a lazy import fails gracefully
         
         # Sync bundled skills (copies new, updates changed, respects user deletions)
         try:
@@ -4297,15 +4348,24 @@ For more help on a command:
     # =========================================================================
     mcp_parser = subparsers.add_parser(
         "mcp",
-        help="Manage MCP server connections",
+        help="Manage MCP servers and run Hermes as an MCP server",
         description=(
-            "Add, remove, list, test, and configure MCP server connections.\n\n"
+            "Manage MCP server connections and run Hermes as an MCP server.\n\n"
             "MCP servers provide additional tools via the Model Context Protocol.\n"
-            "Use 'hermes mcp add' to connect to a new server with interactive\n"
-            "tool discovery. Run 'hermes mcp' with no subcommand to list servers."
+            "Use 'hermes mcp add' to connect to a new server, or\n"
+            "'hermes mcp serve' to expose Hermes conversations over MCP."
         ),
     )
     mcp_sub = mcp_parser.add_subparsers(dest="mcp_action")
+
+    mcp_serve_p = mcp_sub.add_parser(
+        "serve",
+        help="Run Hermes as an MCP server (expose conversations to other agents)",
+    )
+    mcp_serve_p.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable verbose logging on stderr",
+    )
 
     mcp_add_p = mcp_sub.add_parser("add", help="Add an MCP server (discovery-first install)")
     mcp_add_p.add_argument("name", help="Server name (used as config key)")
